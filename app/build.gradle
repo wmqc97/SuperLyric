@@ -1,0 +1,153 @@
+plugins {
+    alias(libs.plugins.android.application)
+    alias(libs.plugins.kotlin.compose)
+}
+
+android {
+    Properties properties = new Properties()
+    File localPropertiesFile = project.rootProject.file('local.properties')
+    if (localPropertiesFile.exists()) {
+        localPropertiesFile.withInputStream { properties.load(it) }
+    }
+
+    def signingPropertyNames = ['keyStoreFile', 'keyStorePassword', 'keyAlias', 'keyAliasPassword']
+    def hasReleaseSigning = signingPropertyNames.every { properties.getProperty(it)?.trim() }
+    if (!hasReleaseSigning) {
+        logger.warn('Release signing credentials are incomplete or local.properties is missing; release APKs will be built unsigned. ' +
+            'Define keyStoreFile, keyStorePassword, keyAlias, and keyAliasPassword to sign release builds.')
+    }
+
+    signingConfigs {
+        if (hasReleaseSigning) {
+            release {
+                storeFile file(properties.getProperty('keyStoreFile'))
+                storePassword properties.getProperty('keyStorePassword')
+                keyAlias properties.getProperty('keyAlias')
+                keyPassword properties.getProperty('keyAliasPassword')
+                enableV1Signing true
+                enableV2Signing true
+                enableV3Signing true
+                enableV4Signing true
+            }
+        }
+    }
+
+    namespace "com.hchen.superlyric"
+    compileSdk {
+        version = release(37)
+    }
+
+    defaultConfig {
+        applicationId "com.hchen.superlyric"
+        minSdk 30
+        targetSdk 37
+        // noinspection HighAppVersionCode
+        versionCode 2026101101
+        versionName "4.1"
+
+        ndk {
+            // noinspection ChromeOsAbiSupport
+            abiFilters 'arm64-v8a'
+        }
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled true
+            shrinkResources true
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+            signingConfig hasReleaseSigning ? signingConfigs.release : null
+        }
+
+        debug {
+            minifyEnabled false
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_21
+        targetCompatibility JavaVersion.VERSION_21
+    }
+
+    buildFeatures {
+        aidl true
+        compose true
+        buildConfig true
+    }
+
+    androidResources {
+        generateLocaleConfig = true
+    }
+
+    lint {
+        abortOnError false
+        checkReleaseBuilds false
+    }
+
+    testOptions {
+        unitTests.all {
+            it.useJUnitPlatform()
+        }
+        // 部分待测逻辑（如 Spotify 解析层）在**错误分支**会经 AndroidLog 调到
+        // android.util.Log；JVM 单测里这些方法默认抛 "not mocked"。
+        // 返回默认值即可让这些分支按"日志静默"跑通，不影响被测逻辑。
+        unitTests.returnDefaultValues = true
+    }
+}
+
+androidComponents {
+    onVariants(selector()) { variant ->
+        def buildType = variant.buildType
+
+        variant.outputs.forEach { output ->
+            def vName = output.versionName.get()
+            def vCode = output.versionCode.get()
+            output.outputFileName.set("SuperLyric-v${vName}-${vCode}-${buildType}.apk")
+        }
+    }
+}
+
+dependencies {
+    configurations.configureEach {
+        resolutionStrategy.cacheChangingModulesFor 0, 'seconds'
+        resolutionStrategy.cacheDynamicVersionsFor 0, 'seconds'
+    }
+
+    implementation libs.appcompat
+    implementation libs.annotation
+
+    implementation platform(libs.compose.bom)
+    implementation libs.foundation.android
+    implementation libs.activity.compose
+    implementation libs.ui.graphics
+    implementation libs.lifecycle.viewmodel.ktx
+
+    implementation libs.miuix.core.android
+    implementation libs.miuix.ui.android
+    implementation libs.miuix.preference.android
+    implementation libs.miuix.blur.android
+    implementation libs.miuix.icons.android
+    implementation libs.miuix.shader.android
+    implementation libs.miuix.squircle.android
+
+    compileOnly libs.api
+    implementation libs.service
+    implementation libs.hooktool
+    implementation libs.dexkit
+    implementation libs.dexkitcache
+    implementation libs.mmkv
+    implementation libs.gson
+    implementation libs.okhttp
+    implementation libs.okhttp.brotli
+    // 版本是固定 tag：不要加 changing = true。它买不到任何东西，却让构建不可复现
+    // （JitPack 会为同一个 tag 重新构建，同样的版本号不保证字节一致）
+    implementation libs.superlyricapi
+    implementation project(':lyric-kernel')
+
+    implementation project(':processor')
+    annotationProcessor project(':processor')
+
+    testImplementation platform(libs.junit.bom)
+    testImplementation libs.junit.jupiter
+    testRuntimeOnly libs.junit.platform.launcher
+}

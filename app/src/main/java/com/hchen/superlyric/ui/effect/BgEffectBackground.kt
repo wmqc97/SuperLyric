@@ -1,0 +1,196 @@
+/*
+ * This file is part of SuperLyric.
+ *
+ * SuperLyric is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as
+ * published by the Free Software Foundation, either version 3 of the
+ * License.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program. If not, see <https://www.gnu.org/licenses/>.
+ *
+ * Copyright (C) 2025-2026 HChenX
+ */
+package com.hchen.superlyric.ui.effect
+
+import androidx.compose.animation.core.Animatable
+import androidx.compose.animation.core.spring
+import androidx.compose.foundation.isSystemInDarkTheme
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxScope
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.remember
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.RectangleShape
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalWindowInfo
+import androidx.compose.ui.unit.dp
+import com.hchen.superlyric.ui.data.UIConstants
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
+import top.yukonga.miuix.kmp.blur.BlendColorEntry
+import top.yukonga.miuix.kmp.blur.BlurDefaults
+import top.yukonga.miuix.kmp.blur.LayerBackdrop
+import top.yukonga.miuix.kmp.blur.isRuntimeShaderSupported
+import top.yukonga.miuix.kmp.blur.rememberLayerBackdrop
+import top.yukonga.miuix.kmp.blur.textureBlur
+import top.yukonga.miuix.kmp.theme.MiuixTheme
+import kotlin.math.floor
+
+enum class BgEffectTheme {
+    DEFAULT,
+    SUNSET,
+}
+
+@Composable
+fun BgEffectBackground(
+    dynamicBackground: Boolean,
+    modifier: Modifier = Modifier,
+    bgModifier: Modifier = Modifier,
+    isFullSize: Boolean = false,
+    effectBackground: Boolean = true,
+    isOs3Effect: Boolean = true,
+    effectTheme: BgEffectTheme = BgEffectTheme.DEFAULT,
+    alpha: () -> Float = { 1f },
+    content: @Composable (BoxScope.() -> Unit),
+) {
+    val shaderSupported = remember { isRuntimeShaderSupported() }
+    if (!shaderSupported) {
+        Box(modifier = modifier, content = content)
+        return
+    }
+    Box(
+        modifier = modifier,
+    ) {
+        val isDarkTheme = isSystemInDarkTheme()
+        val surface = MiuixTheme.colorScheme.surface
+        val deviceType = if (shouldShowSplitPane()) DeviceType.PAD else DeviceType.PHONE
+        val painter = remember(isOs3Effect) { BgEffectPainter(isOs3Effect) }
+
+        val preset = remember(deviceType, isDarkTheme, isOs3Effect, effectTheme) {
+            BgEffectConfig.get(deviceType, isDarkTheme, isOs3Effect, effectTheme)
+        }
+
+        val colorStage = remember { Animatable(0f) }
+
+        LaunchedEffect(dynamicBackground, preset) {
+            if (!dynamicBackground) return@LaunchedEffect
+            val animatesColors = preset.colors1 !== preset.colors2 || preset.colors2 !== preset.colors3
+            if (!animatesColors) return@LaunchedEffect
+
+            var targetStage = floor(colorStage.value) + 1f
+            while (isActive) {
+                delay((preset.colorInterpPeriod * 500).toLong())
+                colorStage.animateTo(
+                    targetValue = targetStage,
+                    animationSpec = spring(dampingRatio = 0.9f, stiffness = 35f),
+                )
+                targetStage += 1f
+            }
+        }
+
+        Spacer(
+            modifier = Modifier
+                .fillMaxSize()
+                .then(bgModifier)
+                .bgEffectDraw(
+                    painter = painter,
+                    preset = preset,
+                    surface = surface,
+                    effectBackground = effectBackground,
+                    isFullSize = isFullSize,
+                    playing = dynamicBackground,
+                    colorStage = { colorStage.value },
+                    alpha = alpha,
+                ),
+        )
+        content()
+    }
+}
+
+@Composable
+private fun shouldShowSplitPane(): Boolean {
+    val windowInfo = LocalWindowInfo.current
+    val density = LocalDensity.current
+    return with(density) {
+        val widthDp = windowInfo.containerSize.width.toDp()
+        val heightDp = windowInfo.containerSize.height.toDp()
+        val ratio = heightDp / widthDp
+        widthDp >= UIConstants.WIDE_SCREEN_THRESHOLD ||
+                (widthDp >= UIConstants.MEDIUM_WIDTH_THRESHOLD && ratio < UIConstants.PORTRAIT_ASPECT_RATIO_THRESHOLD)
+    }
+}
+
+@Composable
+fun rememberBlurBackdrop(): LayerBackdrop? {
+    if (!isRuntimeShaderSupported()) return null
+    val surfaceColor = MiuixTheme.colorScheme.surface
+    return rememberLayerBackdrop {
+        drawRect(surfaceColor)
+        drawContent()
+    }
+}
+
+@Composable
+fun BlurredBar(
+    modifier: Modifier = Modifier,
+    backdrop: LayerBackdrop?,
+    blurEnabled: Boolean,
+    content: @Composable () -> Unit,
+) {
+    Box(
+        modifier = modifier
+            .then(
+                if (blurEnabled && backdrop != null) {
+                    Modifier.textureBlur(
+                        backdrop = backdrop,
+                        shape = RectangleShape,
+                        blurRadius = 25f,
+                        colors = BlurDefaults.blurColors(
+                            blendColors = listOf(
+                                BlendColorEntry(color = MiuixTheme.colorScheme.surface.copy(0.8f)),
+                            ),
+                        ),
+                    )
+                } else {
+                    Modifier
+                }
+            )
+    ) {
+        content()
+    }
+}
+
+@Composable
+fun Modifier.cardBlur(
+    backdrop: LayerBackdrop?,
+    cardBlend: List<BlendColorEntry>,
+    shape: androidx.compose.ui.graphics.Shape = RoundedCornerShape(16.dp),
+    blurRadius: Float = 60f,
+): Modifier = this.then(
+    if (backdrop != null) {
+        Modifier.textureBlur(
+            backdrop = backdrop,
+            shape = shape,
+            blurRadius = blurRadius,
+            noiseCoefficient = BlurDefaults.NoiseCoefficient,
+            colors = BlurDefaults.blurColors(
+                blendColors = cardBlend,
+                brightness = 0f,
+                contrast = 1f,
+                saturation = 1f,
+            ),
+        )
+    } else {
+        Modifier
+    }
+)
