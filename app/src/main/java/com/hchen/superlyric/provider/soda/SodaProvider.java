@@ -21,10 +21,12 @@ package com.hchen.superlyric.provider.soda;
 import android.media.MediaMetadata;
 
 import androidx.annotation.NonNull;
+import androidx.annotation.Nullable;
 
 import com.hchen.processor.HookThis;
 import com.hchen.superlyric.kernel.identity.TrackIdentity;
 import com.hchen.superlyric.kernel.orchestrate.LyricOrchestrator;
+import com.hchen.superlyric.kernel.orchestrate.LyricSource;
 import com.hchen.superlyric.provider.base.HookLyricSource;
 import com.hchen.superlyric.provider.base.MusicProvider;
 
@@ -68,6 +70,23 @@ public class SodaProvider extends MusicProvider {
     @Override
     protected HookLyricSource createHookSource() {
         return new SodaHookSource();
+    }
+
+    /**
+     * 刻意不挂任何跨源 API 兜底。
+     *
+     * <p>汽水的歌词由宿主自己按曲目 id 装载，与当前播放严格同源；而跨源兜底只能按
+     * 「歌名 + 歌手」去别的库检索，命中即发布 —— 对翻唱、同名曲、UGC 视频条目都会
+     * 命中另一份歌词，且它与 Hook 拿到的正文共用同一个身份与播放位置，两套时轴互相顶替，
+     * 表现为播到一半歌词和当前曲目对不上。
+     *
+     * <p>因此这里显式返回 {@code null}，而不是依赖基类默认值：将来基类若给
+     * {@code createApiSource()} 加了默认实现，本 Provider 也不会被悄悄接上兜底。
+     */
+    @Nullable
+    @Override
+    protected LyricSource createApiSource() {
+        return null;
     }
 
     /**
