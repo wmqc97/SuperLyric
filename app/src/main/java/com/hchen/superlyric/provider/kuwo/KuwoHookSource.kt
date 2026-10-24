@@ -28,7 +28,6 @@ import com.hchen.superlyric.kernel.pipeline.LyricRequest
 import com.hchen.superlyric.provider.base.HookLyricSource
 import com.hchen.superlyric.utils.LyricDiag
 
-import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
 
 /**
@@ -76,22 +75,36 @@ class KuwoHookSource : HookLyricSource {
     private var capturedRid: String? = null
 
     /**
-     * 按 rid 索引的宿主真实曲目信息
+     * 按 rid 索引的宿主真实曲目信息（访问序 LRU）
      *
      * 酷我把当前歌词行写进 {@code MediaMetadata.METADATA_KEY_TITLE}，元数据不可信；
      * 而宿主自己的 {@code Music} 对象带着干净的曲名与歌手，且其 {@code rid} 与
      * 歌词回调同一时序到达，可精确关联。
+     *
+     * **不能"满了整表清空"**：那会把当前曲目的标题一起抹掉，Provider 侧的身份随即从
+     * `kuwo:<rid>#<标题>` 退化成 `kuwo:<rid>`，编排器把这次退化当成换歌重新取词；
+     * 而宿主通常不会重新解析，歌词就此中断。访问序保证正在播的那一条每次构造身份都被读到，
+     * 永远在最热的一端，被淘汰的只会是预取过、还没轮到的曲目。
      */
-    private val trackStore = ConcurrentHashMap<String, KuwoTrack>()
+    private val trackStore = object : LinkedHashMap<String, KuwoTrack>(16, 0.75f, true) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, KuwoTrack>): Boolean =
+            size > MAX_CACHED_TRACKS
+    }
 
     /**
-     * 已解析、尚未被会话消费的结果。宿主先给歌词后发元数据，见 [start] 的补投。
+     * 已解析、尚未被会话消费的结果，按 rid 暂存。宿主先给歌词后发元数据，见 [start] 的补投。
      *
      * 三个字段必须一起读、一起写，所以合成一个不可变快照：分成三个 `@Volatile` 字段时，
      * [start] 可能读到新正文配旧标识（或反之），补投判定就会拿错身份。
+     *
+     * **必须是多槽而不是单槽**：宿主会预取播放队列里后面几首的歌词 —— 实测一次启动后的
+     * 6 秒内解析了 76 / 42 / 63 / 76 行四份正文，分属四首不同的曲目。单槽只会留下最后
+     * 一份，先播的那一首真正切过去时，它的正文已被后一份顶掉，只能等宿主重新解析 ——
+     * 而宿主不会，表现为切歌后整首没有歌词。按 rid 各存一份，切到哪首补投哪首。
+     *
+     * 访问一律走 [stashByRid] 的锁：写入在解析线程，补投在读会话建立线程。
      */
-    @Volatile
-    private var stash: Stashed? = null
+    private val stashByRid = LinkedHashMap<String, Stashed>(8, 0.75f, true)
 
     /**
      * 最近一次**成功**交付的（标识, 正文）
@@ -136,18 +149,17 @@ class KuwoHookSource : HookLyricSource {
         // 歌词侧只能回退到 MediaSession 的身份，而切歌瞬间两者会短暂错配，
         // 表现为同一份歌词配上了另一个 rid
         capturedRid = rid
-        // 只做缓存，容量到顶即整体清空——保留最近若干首足够覆盖切歌时序
-        if (trackStore.size >= MAX_CACHED_TRACKS) trackStore.clear()
-        trackStore[rid] = KuwoTrack(rid, title, artist)
+        // 容量由 removeEldestEntry 按访问序淘汰最旧的一条，见 trackStore
+        synchronized(trackStore) { trackStore[rid] = KuwoTrack(rid, title, artist) }
     }
 
     override fun currentStableId(): String? = capturedRid
 
     /** 取回指定 rid 的宿主曲名；未知时返回空串 */
-    fun trackTitle(rid: String): String = trackStore[rid]?.title.orEmpty()
+    fun trackTitle(rid: String): String = synchronized(trackStore) { trackStore[rid]?.title }.orEmpty()
 
     /** 取回指定 rid 的宿主歌手；未知时返回空串 */
-    fun trackArtist(rid: String): String = trackStore[rid]?.artist.orEmpty()
+    fun trackArtist(rid: String): String = synchronized(trackStore) { trackStore[rid]?.artist }.orEmpty()
 
     override fun start(identity: TrackIdentity, session: LyricSource.Session) {
         // 首要补救时机：切歌那一刻宿主已跑起来、dex 必然加载完毕，是首轮定位失败后
@@ -164,9 +176,11 @@ class KuwoHookSource : HookLyricSource {
         // 两侧取标题的时机不同 —— 一侧拿到宿主标题、另一侧那一瞬间 trackStore 还没写入，
         // 就会得到 `kuwo:<rid>#<标题>` 与 `kuwo:<rid>` 两种写法。按字符串比会判成
         // "别的曲目"，把刚到手的歌词关在 stash 里等下一次换歌，表现为整首没歌词。
-        val stashed = stash
+        val key = stashKey(identity.stableId)
+        val stashed = synchronized(stashByRid) { stashByRid[key] }
         if (stashed != null && canReplay(stashed, identity)) {
-            stash = null
+            // 只取走刚刚读到的那一份：解析线程可能在两步之间把同一 rid 换成了新正文
+            synchronized(stashByRid) { if (stashByRid[key] === stashed) stashByRid.remove(key) }
             AndroidLog.logD(sourceName, "Replaying stashed lyric for id=${identity.stableId}")
             session.deliver(LyricOutcome.Success(stashed.doc.withMetadata(identity)))
         }
@@ -175,7 +189,7 @@ class KuwoHookSource : HookLyricSource {
     override fun cancel() {
         session = null
         pendingIdentity = null
-        stash = null
+        synchronized(stashByRid) { stashByRid.clear() }
         lastDelivered = null
         lastAttempted = null
         // 一并清掉：残留的旧 rid 会让下一首的歌词回调先被配上上一首的标识
@@ -259,7 +273,7 @@ class KuwoHookSource : HookLyricSource {
                 return@execute
             }
 
-            stash = Stashed(parsed, stableId, session == null)
+            stashPut(stashKey(stableId), Stashed(parsed, stableId, session == null))
             // 解析成功才写 lastDelivered：这份正文确实能出歌词，才值得挡重复回调。
             // 若在解析之前就写，一次失败（线程池被占、宿主这次给的是残包）会让同一份
             // 正文永远命中去重分支而再也进不来，而宿主随后可能不再回调。
@@ -317,6 +331,32 @@ class KuwoHookSource : HookLyricSource {
         val docIdentity = TrackIdentity(sourceName, null, docTitle, stashed.doc.artist, 0L)
         return docIdentity.matches(identity)
     }
+
+    /**
+     * 写入一个暂存槽，超出上限时淘汰最久未访问的一份
+     *
+     * 上限存在的原因：队列预取没有边界，长时间播放会把每一首的正文都留在内存里。
+     * 按访问顺序淘汰，正在等待补投的那几首总在最近访问的一端。
+     */
+    private fun stashPut(key: String, value: Stashed) {
+        synchronized(stashByRid) {
+            stashByRid[key] = value
+            while (stashByRid.size > MAX_STASHED_TRACKS) {
+                val eldest = stashByRid.entries.iterator().next().key
+                stashByRid.remove(eldest)
+            }
+        }
+    }
+
+    /**
+     * 暂存槽的键：稳定标识里剥掉命名空间与标题段后的 rid
+     *
+     * 与 [sameTrack] 的放宽规则一致：`kuwo:<rid>` 与 `kuwo:<rid>#<标题>` 是同一首，
+     * 按 rid 归槽后，先解析到的那一份不会被另一种写法顶掉。读不到 rid（车机版）时
+     * 退化成空串，等价于单槽 —— 那种输入本来也无法区分曲目。
+     */
+    private fun stashKey(stableId: String?): String =
+        TrackIdentity.normalizeStableId(stableId)?.substringBefore('#').orEmpty()
 
     /**
      * 判断两个稳定标识是否指向同一曲目
@@ -404,8 +444,11 @@ class KuwoHookSource : HookLyricSource {
     private companion object {
         const val NAMESPACE = "kuwo"
 
-        /** 宿主真实曲目信息的缓存上限 */
+        /** 宿主真实曲目信息的 LRU 上限；被淘汰的只会是预取过、还没轮到的曲目 */
         const val MAX_CACHED_TRACKS = 32
+
+        /** 预取歌词的暂存槽上限：覆盖队列里预取的几首即可，超出按访问顺序淘汰最旧 */
+        const val MAX_STASHED_TRACKS = 8
 
         /**
          * 可视为"歌词全文"的最小长度

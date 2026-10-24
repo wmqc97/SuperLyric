@@ -162,8 +162,21 @@ abstract class KuwoBaseProvider extends MusicProvider {
         String title = readString(metadata, MediaMetadata.METADATA_KEY_TITLE);
         String artist = readString(metadata, MediaMetadata.METADATA_KEY_ARTIST);
         long duration = metadata.getLong(MediaMetadata.METADATA_KEY_DURATION);
-        String captured = hookStableId();
-        if (captured != null && !captured.isEmpty()) {
+
+        // 当前曲目的 rid 只能取元数据自己的 MEDIA_ID，不能取 Hook 侧最近一次取词的 rid。
+        //
+        // 酷我会在播放列表里预取后面几首的歌词：预取时曲目探针拿到的是**还没开始播**那一首
+        // 的 Music，而元数据回调仍然是当前这一首。若用探针的 rid 拼身份，每次元数据回调都会
+        // 得到一个属于下一首的身份，编排器据此判定"切歌"——清屏、取词、把下一首的歌词发布到
+        // 当前曲目上。真机实测：远山少年播放中，身份被翻成 kuwo:1697454#盛夏的果实，
+        // 随后整首都在放盛夏的果实。这条与"元数据标题是歌词行"无关，是预取时序造成的。
+        //
+        // 探针的 rid 仍然有用：它把 Hook 拿到的歌词正文与它自己那一首绑定（见 KuwoHookSource），
+        // 预取的歌词因此能按 rid 暂存，等那一首真正开始时直接补投。
+        String mediaId = usableRid(readString(metadata, MediaMetadata.METADATA_KEY_MEDIA_ID));
+        String captured = usableRid(hookStableId());
+        String rid = !mediaId.isEmpty() ? mediaId : captured;
+        if (!rid.isEmpty()) {
             KuwoHookSource hook = kuwoHookSource;
             // 组装稳定标识的标题只能取宿主 Music 对象上的干净字段，绝不能取元数据里的 TITLE。
             //
@@ -171,23 +184,33 @@ abstract class KuwoBaseProvider extends MusicProvider {
             // 用的是宿主标题。一旦这里用元数据标题拼标识，就会得到 kuwo:<rid>#<当前歌词行>，
             // 与 Hook 上报的 kuwo:<rid>（或 kuwo:<rid>#<宿主题名>）不是同一个字符串，
             // 于是 Hook 已经拿到的歌词被判为"别的曲目"而丢弃 —— 表现为歌词时有时无。
-            String hostTitle = hook != null ? hook.trackTitle(captured) : "";
-            String hostArtist = hook != null ? hook.trackArtist(captured) : "";
+            String hostTitle = hook != null ? hook.trackTitle(rid) : "";
+            String hostArtist = hook != null ? hook.trackArtist(rid) : "";
             String mergedTitle = hostTitle.isEmpty() ? title : hostTitle;
             String mergedArtist = hostArtist.isEmpty() ? artist : hostArtist;
             // 标题为空时退化为只用 rid（歌曲场景仍可靠）
             return new TrackIdentity(
-                providerTag, stableIdOf(captured, hostTitle), mergedTitle, mergedArtist, duration);
-        }
-
-
-        String mediaId = readString(metadata, MediaMetadata.METADATA_KEY_MEDIA_ID).trim();
-        if (!mediaId.isEmpty()) {
-            return new TrackIdentity(
-                providerTag, stableIdOf(mediaId, title), title, artist, duration);
+                providerTag, stableIdOf(rid, hostTitle), mergedTitle, mergedArtist, duration);
         }
 
         return super.buildIdentity(metadata);
+    }
+
+    /**
+     * 过滤占位标识
+     *
+     * <p>宿主可能把 {@code 0} / {@code -1} / {@code null} 这类常量写进 {@code MEDIA_ID}。
+     * 把它们当成真实标识会让所有曲目的身份相等，编排器按"同一首"处理、永不重新取词。
+     */
+    @NonNull
+    private static String usableRid(@Nullable String raw) {
+        String trimmed = raw != null ? raw.trim() : "";
+        switch (trimmed.toLowerCase(java.util.Locale.ROOT)) {
+            case "", "0", "-1", "null", "unknown", "none":
+                return "";
+            default:
+                return trimmed;
+        }
     }
 
     /**
